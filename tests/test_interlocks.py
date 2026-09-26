@@ -210,6 +210,77 @@ def test_cleaning_alarm_latch_requires_an_in_spec_temperature_to_reset(tmp_path:
     assert result["latch"]["active"] is False
 
 
+def test_cleaning_pump_is_refused_after_the_round_confirmation_cools_off(tmp_path: Path) -> None:
+    runtime = manual_runtime(tmp_path)
+    runtime.control.start_cleaning(reason="test")
+    confirmed = runtime.control.confirm_cleaning_temperature(81.0, reason="operator", ttl_seconds=30.0)
+    assert confirmed["confirmation"]["state"] == "valid"
+    runtime.clock.advance_by(31.0)
+    with pytest.raises(StaleWarrantyError) as failure:
+        runtime.control.start_cleaning_pump(6000.0, reason="operator")
+    assert failure.value.details["state"] == "elapsed"
+    assert runtime.control.cip.is_running() is False
+    # A fresh confirmation from the current round unlocks the pump again.
+    runtime.control.confirm_cleaning_temperature(81.0, reason="operator", ttl_seconds=30.0)
+    assert runtime.control.start_cleaning_pump(6000.0, reason="operator")["action"] == "pump-start"
+
+
+def test_a_cleaning_temperature_confirmation_is_single_use(tmp_path: Path) -> None:
+    runtime = manual_runtime(tmp_path)
+    runtime.control.start_cleaning(reason="test")
+    confirmed = runtime.control.confirm_cleaning_temperature(81.0, reason="operator")
+    runtime.control.start_cleaning_pump(6000.0, reason="operator")
+    assert confirmed["confirmation"]["confirmation_id"] not in {
+        cid for cid, item in runtime.warranties.inventory()["confirmations"].items() if item["state"] == "valid"
+    }
+    runtime.control.cip.stop_pump(reason="test")
+    # The pump cannot ride the same confirmation a second time.
+    with pytest.raises(StaleWarrantyError) as failure:
+        runtime.control.start_cleaning_pump(6000.0, reason="operator")
+    assert failure.value.details["state"] == "consumed"
+
+
+def test_alarm_reset_uses_the_retest_value_not_the_remembered_temperature(tmp_path: Path) -> None:
+    runtime = manual_runtime(tmp_path)
+    runtime.control.start_cleaning(reason="test")
+    runtime.control.confirm_cleaning_temperature(81.0, reason="operator")
+    runtime.control.cip.raise_alarm(reason="conductivity deviation")
+    # The remembered confirmation is still hot; only a cold field retest was taken.
+    with pytest.raises(LatchActiveError):
+        runtime.control.cip.reset_alarm(value_c=42.0, reason="operator")
+    assert runtime.control.cip.alarm_active() is True
+
+
+def test_a_denied_alarm_reset_and_its_retest_leave_a_trail(tmp_path: Path) -> None:
+    runtime = manual_runtime(tmp_path)
+    runtime.control.start_cleaning(reason="test")
+    runtime.control.cip.raise_alarm(reason="conductivity deviation")
+    with pytest.raises(LatchActiveError):
+        runtime.control.cip.reset_alarm(value_c=42.0, reason="operator")
+    assert runtime.audit.entries(action="cip-alarm-reset-denied", target="cip")[0].detail == "retest 42 C"
+    accepted = runtime.control.cip.reset_alarm(value_c=80.5, reason="operator")
+    assert accepted["confirmation"]["state"] == "consumed"
+    assert accepted["confirmation"]["subject"] == "cip-alarm-retest"
+    reset_entry = runtime.audit.entries(action="cip-alarm-reset", target="cip")[0]
+    assert accepted["confirmation"]["confirmation_id"] in reset_entry.detail
+    assert runtime.audit.verify()["valid"] is True
+
+
+def test_an_alarm_reset_cannot_reuse_its_retest_confirmation(tmp_path: Path) -> None:
+    runtime = manual_runtime(tmp_path)
+    runtime.control.start_cleaning(reason="test")
+    runtime.control.cip.raise_alarm(reason="first deviation")
+    outcome = runtime.control.cip.reset_alarm(value_c=80.5, reason="operator")
+    assert outcome["latch"]["active"] is False
+    runtime.control.cip.raise_alarm(reason="second deviation")
+    # A new alarm demands a new on-site retest; the old evidence is consumed.
+    with pytest.raises(LatchActiveError):
+        runtime.control.cip.reset_alarm(value_c=42.0, reason="operator")
+    again = runtime.control.cip.reset_alarm(value_c=80.0, reason="operator")
+    assert again["latch"]["active"] is False
+    assert again["confirmation"]["confirmation_id"] != outcome["confirmation"]["confirmation_id"]
+
+
 def test_aseptic_pressure_latch_blocks_the_fill_until_the_band_recovers(tmp_path: Path) -> None:
     runtime = sterilized_aseptic_runtime(tmp_path)
     runtime.control.start_hold(reason="test")

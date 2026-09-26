@@ -289,3 +289,15 @@ def test_hold_recover_and_cleaning_routes_settle_their_latches(live_server: Cons
     assert status == 200 and pump["action"] == "pump-start"
     status, done = http_request(live_server, "POST", "/api/cip/complete", {"elapsed_seconds": 200.0})
     assert status == 200 and done["stage"]["to_stage"] == "idle"
+
+
+def test_cleaning_alarm_reset_route_requires_a_fresh_hot_retest(live_server: ConsoleServer) -> None:
+    http_request(live_server, "POST", "/api/cip/enter", {})
+    http_request(live_server, "POST", "/api/cip/confirm", {"temperature_c": 81.0})
+    status, raised = http_request(live_server, "POST", "/api/cip/alarm", {"reason": "conductivity deviation"})
+    assert status == 200 and raised["active"] is True
+    status, denied = http_request(live_server, "POST", "/api/cip/alarm/reset", {"temperature_c": 42.0})
+    assert status == 423 and denied["error"] == "latch-active"
+    status, reset = http_request(live_server, "POST", "/api/cip/alarm/reset", {"temperature_c": 80.5})
+    assert status == 200 and reset["latch"]["active"] is False
+    assert reset["confirmation"]["subject"] == "cip-alarm-retest"

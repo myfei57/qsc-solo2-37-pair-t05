@@ -131,6 +131,8 @@ class ConsoleApp:
         router.post("/api/cip/confirm", self._cip_confirm, "confirm the cleaning temperature")
         router.post("/api/cip/enter", self._cip_enter, "enter the cleaning branch")
         router.post("/api/cip/start", self._cip_start, "start the cleaning pump")
+        router.post("/api/cip/alarm", self._cip_alarm, "raise the cleaning alarm latch")
+        router.post("/api/cip/alarm/reset", self._cip_alarm_reset, "reset the cleaning alarm against a fresh retest")
         router.post("/api/cip/complete", self._cip_complete, "complete the cleaning cycle")
         router.post("/api/baselines", self._baseline, "record a flow baseline")
         router.post("/api/snapshots", self._snapshot, "capture a configuration snapshot")
@@ -358,6 +360,18 @@ class ConsoleApp:
 
     def _cip_start(self, params: dict[str, str], query: dict[str, str], body: dict[str, Any]) -> Any:
         return self.control.start_cleaning_pump(_number(body, "flow_lph"), reason=_text(body, "reason", "operator"))
+
+    def _cip_alarm(self, params: dict[str, str], query: dict[str, str], body: dict[str, Any]) -> Any:
+        return self.control.cip.raise_alarm(
+            reason=_text(body, "reason", "cleaning deviation"),
+            detail=_text(body, "detail", ""),
+        )
+
+    def _cip_alarm_reset(self, params: dict[str, str], query: dict[str, str], body: dict[str, Any]) -> Any:
+        return self.control.cip.reset_alarm(
+            value_c=_number(body, "temperature_c"),
+            reason=_text(body, "reason", "operator"),
+        )
 
     def _cip_complete(self, params: dict[str, str], query: dict[str, str], body: dict[str, Any]) -> Any:
         return self.control.finish_cleaning(

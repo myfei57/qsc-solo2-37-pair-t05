@@ -172,8 +172,19 @@ def _cleaning_latch(runtime: Runtime) -> dict[str, Any]:
     control = runtime.control
     steps: list[dict[str, Any]] = []
     steps.append({"step": "enter-cleaning", **_attempt(lambda: control.start_cleaning(reason="scenario"))})
+    first_confirm = _attempt(lambda: control.confirm_cleaning_temperature(81.0, reason="scenario"))
+    steps.append({"step": "confirm", **first_confirm})
+    # The wash temperature cools off long before anyone starts the pump: the
+    # round's confirmation goes stale, so the start must be refused.
+    runtime.clock.advance_by(1000.0)
     steps.append(
-        {"step": "confirm", **_attempt(lambda: control.confirm_cleaning_temperature(81.0, reason="scenario"))}
+        {
+            "step": "start-on-cooled-confirmation",
+            **_attempt(lambda: control.start_cleaning_pump(6000.0, reason="scenario")),
+        }
+    )
+    steps.append(
+        {"step": "reconfirm", **_attempt(lambda: control.confirm_cleaning_temperature(80.5, reason="scenario"))}
     )
     steps.append({"step": "alarm", **_attempt(lambda: control.cip.raise_alarm(reason="deviation detected"))})
     steps.append(

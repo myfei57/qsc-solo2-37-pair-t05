@@ -67,7 +67,7 @@ DEFAULT_LATCHES: tuple[tuple[str, str, str], ...] = (
     (
         latch_names.CIP_ALARM,
         "cleaning alarm latch",
-        "cleaning temperature confirmed inside the wash window",
+        "fresh field retest confirms the wash temperature window",
     ),
     (
         latch_names.ASEPTIC_PRESSURE,

@@ -95,6 +95,17 @@ def test_cleaning_section_snapshot_reports_the_confirmation(tmp_path: Path) -> N
     assert snapshot["temperature_c"] == 81.5
     assert snapshot["confirmation_id"] == result["confirmation"]["confirmation_id"]
     assert snapshot["alarm_active"] is False
+    confirmation = runtime.warranties.require_confirmation(
+        result["confirmation"]["confirmation_id"],
+        scope="cleaning",
+        subject="cip-temperature",
+    )
+    assert confirmation.expires_at > confirmation.issued_at
+    event = runtime.events.pending()[-1]
+    assert event.kind == "cip-temperature-confirm"
+    assert event.payload["confirmation_id"] == confirmation.confirmation_id
+    audit = runtime.audit.entries(action="cip-confirm", target="cip")[0]
+    assert confirmation.confirmation_id in audit.detail
 
 
 def test_cleaning_pump_cannot_start_twice(tmp_path: Path) -> None:

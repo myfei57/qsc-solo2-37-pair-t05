@@ -59,8 +59,12 @@ def test_shutdown_order_scenario_reports_the_blocked_step(tmp_path: Path) -> Non
 def test_cleaning_latch_scenario_clears_only_with_an_in_spec_temperature(tmp_path: Path) -> None:
     result = run_scenario(manual_runtime(tmp_path), "cleaning-latch")
     steps = {step["step"]: step for step in result["steps"]}
+    assert steps["start-on-cooled-confirmation"]["error"] == "stale-warranty"
+    assert steps["start-on-cooled-confirmation"]["details"]["state"] == "elapsed"
+    assert steps["reconfirm"]["ok"] is True
     assert steps["reset-with-cold-water"]["error"] == "latch-active"
     assert steps["reset-with-hot-water"]["ok"] is True
+    assert steps["start-pump"]["ok"] is True
     assert result["stage"] == "idle"
 
 
