@@ -6,7 +6,7 @@ from typing import Any
 
 from ..core.clock import Clock
 from ..core.config import ControlConfig, require_within
-from ..errors import RangeError, StateError
+from ..errors import RangeError, StateError, ValidationError
 from ..persistence.audit import AuditLedger
 from ..persistence.journal import RecordJournal
 from ..persistence.store import DurableStore
@@ -15,6 +15,9 @@ from ..stages import latches as latch_names
 from ..stages.gates import GateBoard
 from ..stages.latches import LatchBoard
 from ..versioning.warranties import Confirmation, WarrantyBook
+
+CONFIRMATION_SCOPE = "cleaning"
+CONFIRMATION_SUBJECT = "cip-temperature"
 
 
 class CipCycle:
@@ -71,6 +74,8 @@ class CipCycle:
         return self._running
 
     def confirm_temperature(self, value_c: float, *, reason: str, ttl_seconds: float | None = None) -> dict[str, Any]:
+        """Issue this cycle's temperature confirmation; the pump keys off it."""
+
         envelope = self.config.cleaning
         value = require_within(
             value_c,
@@ -79,33 +84,57 @@ class CipCycle:
             field_name="temperature_c",
             scope="cleaning",
         )
+        confirmation = self.warranties.issue_confirmation(
+            CONFIRMATION_SCOPE,
+            CONFIRMATION_SUBJECT,
+            ttl_seconds=ttl_seconds,
+            reason=str(reason),
+        )
         self._temperature_c = value
-        self._confirmation_id = None
+        self._confirmation_id = confirmation.confirmation_id
         self.gates.open(
             gate_names.CIP_TEMPERATURE_CONFIRMED,
             reason=str(reason),
-            evidence=f"{value:g}C",
+            evidence=confirmation.confirmation_id,
         )
         record = self.events.append(
             "cip-temperature-confirm",
-            {"temperature_c": value, "reason": str(reason)},
+            {
+                "temperature_c": value,
+                "confirmation_id": confirmation.confirmation_id,
+                "expires_at": confirmation.expires_at,
+                "reason": str(reason),
+            },
         )
         entry = {
             "action": "confirm",
             "temperature_c": value,
-            "confirmation_id": None,
+            "confirmation_id": confirmation.confirmation_id,
             "record_id": record.record_id,
             "reason": str(reason),
             "timestamp": self.clock.timestamp(),
         }
         self._history.append(entry)
         self.persist()
-        self.audit.record("cip-confirm", "cip", f"{value:g} C", cause=None)
-        return {"temperature_c": value, "event": entry}
+        self.audit.record("cip-confirm", "cip", f"{value:g} C {confirmation.confirmation_id}", cause=None)
+        return {"temperature_c": value, "confirmation": confirmation.as_dict(), "event": entry}
+
+    def require_confirmation(self) -> Confirmation:
+        """The confirmation the pump must present, still valid on this cycle."""
+
+        if self._confirmation_id is None:
+            self.gates.require_open(gate_names.CIP_TEMPERATURE_CONFIRMED, action="cip-pump-start")
+            raise StateError("the cleaning temperature has never been confirmed", section="cip")
+        return self.warranties.require_confirmation(
+            self._confirmation_id,
+            scope=CONFIRMATION_SCOPE,
+            subject=CONFIRMATION_SUBJECT,
+        )
 
     def start_pump(self, *, flow_lph: float, reason: str) -> dict[str, Any]:
         self.latches.require_clear(latch_names.CIP_ALARM, action="cip-pump-start")
         self.gates.require_open(gate_names.CIP_TEMPERATURE_CONFIRMED, action="cip-pump-start")
+        confirmation = self.require_confirmation()
         if not self.config.cleaning.wash_in_spec(self._temperature_c):
             raise StateError("the cleaning temperature is outside the wash window", section="cip")
         flow = require_within(
@@ -118,17 +147,25 @@ class CipCycle:
         if self._running:
             raise StateError("the cleaning pump is already running", section="cip")
         self._running = True
-        record = self.events.append("cip-pump-start", {"flow_lph": flow, "reason": str(reason)})
+        record = self.events.append(
+            "cip-pump-start",
+            {
+                "flow_lph": flow,
+                "confirmation_id": confirmation.confirmation_id,
+                "reason": str(reason),
+            },
+        )
         entry = {
             "action": "pump-start",
             "flow_lph": flow,
+            "confirmation_id": confirmation.confirmation_id,
             "record_id": record.record_id,
             "reason": str(reason),
             "timestamp": self.clock.timestamp(),
         }
         self._history.append(entry)
         self.persist()
-        self.audit.record("cip-pump-start", "cip", f"{flow:g} L/h", cause=None)
+        self.audit.record("cip-pump-start", "cip", f"{flow:g} L/h {confirmation.confirmation_id}", cause=None)
         return dict(entry)
 
     def stop_pump(self, *, reason: str) -> dict[str, Any]:
@@ -148,22 +185,42 @@ class CipCycle:
         return latch.as_dict()
 
     def reset_alarm(self, *, value_c: float, reason: str) -> dict[str, Any]:
-        """The alarm latch clears only against a freshly confirmed temperature."""
+        """The alarm latch clears only against a re-measured in-spec temperature."""
 
         envelope = self.config.cleaning
-        in_spec = envelope.wash_in_spec(float(self._temperature_c))
+        try:
+            measured = float(value_c)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("value_c must be a number", field="value_c", scope="cleaning") from exc
+        in_spec = envelope.wash_in_spec(measured)
         latch = self.latches.clear(
             latch_names.CIP_ALARM,
             reason=reason,
             satisfied=in_spec,
-            detail=f"temperature_in_spec={in_spec}",
+            detail=f"remeasured_c={measured:g} temperature_in_spec={in_spec}",
         )
-        self._history.append(
-            {"action": "alarm-reset", "value_c": float(value_c), "cleared": not latch.active, "reason": str(reason)}
+        record = self.events.append(
+            "cip-alarm-reset",
+            {"value_c": measured, "in_spec": in_spec, "reason": str(reason)},
         )
+        entry = {
+            "action": "alarm-reset",
+            "value_c": measured,
+            "in_spec": in_spec,
+            "cleared": not latch.active,
+            "record_id": record.record_id,
+            "reason": str(reason),
+            "timestamp": self.clock.timestamp(),
+        }
+        self._history.append(entry)
         self.persist()
-        self.audit.record("cip-alarm-reset", "cip", f"cleared={not latch.active}", cause=None)
-        return {"latch": latch.as_dict(), "temperature_in_spec": in_spec}
+        self.audit.record("cip-alarm-reset", "cip", f"remeasured {measured:g} C cleared={not latch.active}", cause=None)
+        return {
+            "latch": latch.as_dict(),
+            "temperature_in_spec": in_spec,
+            "value_c": measured,
+            "record_id": record.record_id,
+        }
 
     def cycle_complete(self, *, elapsed_seconds: float, reason: str) -> dict[str, Any]:
         minimum = self.config.cleaning.minimum_cycle_seconds

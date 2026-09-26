@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -208,6 +209,61 @@ def test_cleaning_alarm_latch_requires_an_in_spec_temperature_to_reset(tmp_path:
         runtime.control.cip.reset_alarm(value_c=40.0, reason="operator")
     result = runtime.control.cip.reset_alarm(value_c=80.5, reason="operator")
     assert result["latch"]["active"] is False
+
+
+def test_cleaning_pump_is_refused_once_the_confirmation_cools_off(tmp_path: Path) -> None:
+    runtime = manual_runtime(tmp_path)
+    runtime.control.start_cleaning(reason="operator")
+    runtime.control.confirm_cleaning_temperature(81.0, reason="operator", ttl_seconds=60.0)
+    runtime.control.advance_time(61.0)
+    with pytest.raises(StaleWarrantyError) as failure:
+        runtime.control.start_cleaning_pump(6000.0, reason="operator")
+    assert failure.value.details["state"] == "elapsed"
+
+
+def test_cleaning_pump_requires_a_confirmation_from_the_current_cycle(tmp_path: Path) -> None:
+    runtime = manual_runtime(tmp_path)
+    runtime.control.start_cleaning(reason="operator")
+    runtime.control.confirm_cleaning_temperature(81.0, reason="operator")
+    changed = replace(runtime.config, cleaning=replace(runtime.config.cleaning, rinse_seconds=45.0))
+    runtime.control.apply_config(changed, reason="recipe update")
+    with pytest.raises(StaleWarrantyError) as failure:
+        runtime.control.start_cleaning_pump(6000.0, reason="operator")
+    assert failure.value.details["state"] == "superseded"
+
+
+def test_cleaning_pump_start_is_traced_to_its_confirmation(tmp_path: Path) -> None:
+    runtime = manual_runtime(tmp_path)
+    runtime.control.start_cleaning(reason="operator")
+    confirmed = runtime.control.confirm_cleaning_temperature(81.0, reason="operator")
+    confirmation_id = confirmed["confirmation"]["confirmation_id"]
+    entry = runtime.control.start_cleaning_pump(6000.0, reason="operator")
+    assert entry["confirmation_id"] == confirmation_id
+    record = runtime.events.lookup(entry["record_id"])
+    assert record is not None
+    assert record.payload["confirmation_id"] == confirmation_id
+    audit = runtime.audit.entries(action="cip-pump-start")[-1]
+    assert confirmation_id in audit.detail
+
+
+def test_cleaning_alarm_reset_records_the_remeasured_temperature(tmp_path: Path) -> None:
+    runtime = manual_runtime(tmp_path)
+    runtime.control.start_cleaning(reason="operator")
+    runtime.control.cip.raise_alarm(reason="conductivity deviation")
+    result = runtime.control.cip.reset_alarm(value_c=80.5, reason="operator")
+    assert result["latch"]["active"] is False
+    entry = runtime.cip.history()[-1]
+    assert entry["action"] == "alarm-reset"
+    assert entry["value_c"] == 80.5
+    assert entry["in_spec"] is True
+    assert entry["record_id"]
+    assert entry["timestamp"]
+    record = runtime.events.lookup(entry["record_id"])
+    assert record is not None
+    assert record.payload["value_c"] == 80.5
+    assert record.payload["in_spec"] is True
+    audit = runtime.audit.entries(action="cip-alarm-reset")[-1]
+    assert "80.5" in audit.detail
 
 
 def test_aseptic_pressure_latch_blocks_the_fill_until_the_band_recovers(tmp_path: Path) -> None:

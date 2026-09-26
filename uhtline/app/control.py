@@ -370,7 +370,11 @@ class LineControl:
     ) -> dict[str, Any]:
         result = self.cip.confirm_temperature(value_c, reason=reason, ttl_seconds=ttl_seconds)
         self._count("cip.confirm")
-        return {"confirmed": True, "temperature_c": result["temperature_c"]}
+        return {
+            "confirmed": True,
+            "temperature_c": result["temperature_c"],
+            "confirmation": result["confirmation"],
+        }
 
     def start_cleaning_pump(self, flow_lph: float, *, reason: str) -> dict[str, Any]:
         entry = self.cip.start_pump(flow_lph=flow_lph, reason=reason)
